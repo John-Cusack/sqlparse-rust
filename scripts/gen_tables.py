@@ -34,30 +34,36 @@ TOKENS_RE = re.compile(r"\btokens\.([A-Za-z_][\w.]*)")
 TOKEN_RE = re.compile(r"\bToken\.([A-Za-z_][\w.]*)")
 
 
-def walk_tokens():
+def canonical(obj):
+    """Dotted path of a _TokenType via its parent chain (aliases collapse:
+    tokens.DML -> Token.Keyword.DML). Names are read with vars(), never
+    created."""
     import sqlparse.tokens as T
+    names = []
+    while obj is not None:
+        parent = obj.parent
+        if parent is None:
+            names.append("Token")
+        else:
+            d = vars(parent)
+            nm = next(n for n, v in d.items() if v is obj)
+            names.append(nm)
+        obj = parent
+    return ".".join(reversed(names))
 
+
+def collect_module_paths():
+    """Canonical paths of every _TokenType reachable as a module attr of
+    sqlparse.tokens (getattr on the MODULE never auto-vivifies)."""
+    import sqlparse.tokens as T
     found = set()
-    seen_ids = set()
-
-    def visit(obj, prefix):
-        if id(obj) in seen_ids:
-            return
-        seen_ids.add(id(obj))
-        found.add(prefix)
-        for name in dir(obj):
-            if name.startswith("_"):
-                continue
-            try:
-                child = getattr(obj, name)
-            except AttributeError:
-                continue
-            if isinstance(child, T._TokenType):
-                visit(child, f"{prefix}.{name}")
-
-    visit(T.Token, "Token")
+    for name in dir(T):
+        if name.startswith("_"):
+            continue
+        obj = getattr(T, name)
+        if isinstance(obj, T._TokenType):
+            found.add(canonical(obj))
     return found
-
 
 
 def scan_sources():
@@ -76,31 +82,81 @@ def scan_sources():
     return paths
 
 
+def is_plausible(p):
+    """Lexical junk filter: real ttype parts are non-empty and start
+    uppercase (drops docstring `Token.Comment...`, `tokens.index(node)`)."""
+    parts = p.split(".")
+    if parts[0] != "Token" or len(parts) < 2:
+        return False
+    return all(part[:1].isupper() for part in parts[1:])
+
+
 def main():
     import sqlparse
     assert sqlparse.__version__ == "0.6.0", sqlparse.__version__
 
-    walked = walk_tokens()
-    walked = {p for p in walked if p}
+    import sqlparse.tokens as T
+    walked = collect_module_paths()
     scanned = scan_sources()
 
-    # Every scanned path must resolve to a real _TokenType; method calls on
-    # token lists (e.g. `tokens.index(node)`) do not and are dropped loudly.
-    import sqlparse.tokens as T
+    # Resolve scanned refs to canonical paths. getattr here MAY vivify lazy
+    # children (e.g. Comment.Multiline, created on first lex) — intended:
+    # they are real code references; lexical junk is filtered first.
     resolved = set()
     for p in sorted(scanned):
+        if not is_plausible(p):
+            print(f"drop (junk): {p}")
+            continue
         obj = T.Token
-        try:
-            for part in p.split(".")[1:]:
-                obj = getattr(obj, part)
-        except AttributeError:
-            print(f"drop (no attr): {p}")
+        for part in p.split(".")[1:]:
+            obj = getattr(obj, part)
+            if not isinstance(obj, T._TokenType):
+                break
+        else:
+            resolved.add(canonical(obj))
             continue
-        if not isinstance(obj, T._TokenType):
-            print(f"drop (not a ttype): {p}")
-            continue
-        resolved.add(p)
+        print(f"drop (not a ttype): {p}")
     paths = sorted(walked | resolved)
+
+    # Nd ranges for is_digit (Python re \d = Nd exactly; Rust to_digit is
+    # ASCII-only). Derived from unicodedata, emitted as closed ranges.
+    import unicodedata
+    nd_ranges = []
+    start = None
+    prev = None
+    for cp in range(0x110000):
+        ch = chr(cp)
+        if unicodedata.category(ch) == "Nd":
+            if start is None:
+                start = prev = cp
+            elif cp == prev + 1:
+                prev = cp
+            else:
+                nd_ranges.append((start, prev))
+                start = prev = cp
+    if start is not None:
+        nd_ranges.append((start, prev))
+
+    # Python str \w = L* + N* + U+005F exactly (marks and other Pc
+    # excluded; Rust is_alphanumeric over-covers Other_Alphabetic marks
+    # like U+093E). Derived from unicodedata, emitted as closed ranges.
+    w_ranges = []
+    start = None
+    prev = None
+    for cp in range(0x110000):
+        ch = chr(cp)
+        if unicodedata.category(ch) in (
+            "Lu", "Ll", "Lt", "Lm", "Lo", "Nd", "Nl", "No",
+        ) or cp == 0x5F:
+            if start is None:
+                start = prev = cp
+            elif cp == prev + 1:
+                prev = cp
+            else:
+                w_ranges.append((start, prev))
+                start = prev = cp
+    if start is not None:
+        w_ranges.append((start, prev))
 
 
     def variant(p):
@@ -134,6 +190,7 @@ def main():
         lines.append(f"//   {key}: {first} shadows {later}")
     lines.append("")
     lines.append("#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]")
+    lines.append("#[allow(non_camel_case_types)]")
     lines.append("#[repr(u16)]")
     lines.append("pub enum TType {")
     for p in paths:
@@ -174,9 +231,26 @@ def main():
             lines.append(f"    Some({lit}), // Token.{'.'.join(tt)}")
     lines.append("];")
     lines.append("")
+    lines.append("/// Closed General_Category=Nd ranges (Python `re` `\\d`).")
+    lines.append(f"/// {sum(e - s + 1 for s, e in nd_ranges)} code points in "
+                 f"{len(nd_ranges)} ranges, from unicodedata.")
+    lines.append("pub const ND_RANGES: &[(u32, u32)] = &[")
+    for s, e in nd_ranges:
+        lines.append(f"    (0x{s:04X}, 0x{e:04X}),")
+    lines.append("];")
+    lines.append("")
+    lines.append("/// Closed ranges of Python `str` `\\w` (L* + N* + `_`).")
+    lines.append(f"/// {sum(e - s + 1 for s, e in w_ranges)} code points in "
+                 f"{len(w_ranges)} ranges, from unicodedata.")
+    lines.append("pub const W_RANGES: &[(u32, u32)] = &[")
+    for s, e in w_ranges:
+        lines.append(f"    (0x{s:04X}, 0x{e:04X}),")
+    lines.append("];")
+    lines.append("")
     OUT.write_text("\n".join(lines))
     print(f"wrote {OUT}: {len(paths)} ttypes, {len(merged)} keywords, "
-          f"{len(K.SQL_REGEX)} patterns")
+          f"{len(K.SQL_REGEX)} patterns, {len(nd_ranges)} Nd ranges, "
+          f"{len(w_ranges)} W ranges")
 
 
 if __name__ == "__main__":

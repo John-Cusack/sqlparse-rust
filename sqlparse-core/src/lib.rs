@@ -5,7 +5,7 @@
 //! Python dependency; the whole SQL string crosses once in, results cross
 //! once out. See docs in the rustsmith evidence PR; upstream attribution
 //! in NOTICE.
-
+pub mod lexer;
 pub mod tables_gen;
 
 pub use tables_gen::TType;

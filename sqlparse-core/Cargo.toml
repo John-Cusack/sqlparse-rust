@@ -1,7 +1,7 @@
 [package]
 name = "sqlparse-rust-core"
 version = "0.6.0"
-edition = "2021"
+edition = "2024"
 description = "Pure-Rust lexer + statement splitter + grouping engine + format core for sqlparse (no Python dependency)"
 license = "BSD-3-Clause"
 repository = "https://github.com/John-Cusack/sqlparse-rust"
