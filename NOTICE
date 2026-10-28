@@ -1,0 +1,11 @@
+sqlparse-rust incorporates no upstream source code: it is an independent
+Rust implementation of the SQL lexing / statement-splitting / grouping /
+formatting behavior described by the upstream project below. The
+pure-Python fallback (`sqlparse/_pure.py`) is a byte-identical copy of the
+upstream 0.6.0 `sqlparse` package, used when the Rust extension is
+unavailable or the input is outside the kernel's exact domain (and as the
+correctness oracle for the equivalence suite):
+
+  andialbrecht/sqlparse — https://github.com/andialbrecht/sqlparse
+  Copyright (c) 2016, Andi Albrecht <albrecht.andi@gmail.com>
+  BSD-3-Clause (see upstream LICENSE)
