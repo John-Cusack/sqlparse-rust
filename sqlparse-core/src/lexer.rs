@@ -1032,17 +1032,11 @@ fn find_spans(ch: &[char]) -> Option<SpanTable> {
     Some(t)
 }
 
-/// Lexed output: input chars, byte offset per char (+sentinel), tokens as
-/// byte spans (ready to slice `&str` without re-walking).
-pub struct Lexed {
-    pub chars: Vec<char>,
-    pub bytes: Vec<u32>,
-    pub toks: Vec<RawTok>,
-}
-
 /// Default-configuration lex of the whole string (mirrors
 /// `Lexer.get_default_instance().get_tokens` on `str` input).
-pub fn lex(text: &str) -> Lexed {
+/// Returns tokens as byte spans (ready to slice `&str`); the working
+/// char/offset tables are dropped before returning.
+pub fn lex(text: &str) -> Vec<RawTok> {
     let chars: Vec<char> = text.chars().collect();
     let mut bytes: Vec<u32> = Vec::with_capacity(chars.len() + 1);
     let mut off = 0u32;
@@ -1113,5 +1107,5 @@ pub fn lex(text: &str) -> Lexed {
             pos += 1;
         }
     }
-    Lexed { chars, bytes, toks }
+    toks
 }

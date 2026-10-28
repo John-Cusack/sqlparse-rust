@@ -34,11 +34,13 @@ def test_pure_env_fallback():
 
 
 def test_missing_extension_fallback(monkeypatch):
+    # Simulate an environment without the compiled extension, regardless
+    # of import state: block the module AND drop any parent attribute.
     monkeypatch.setitem(sys.modules, "sqlparse._sqlparse", None)
+    monkeypatch.delattr(sqlparse, "_sqlparse", raising=False)
     assert not _bridge.use_rust()
     assert not _bridge.core_available()
     assert len(sqlparse.parse("select 1")) == 1
-
 
 def test_custom_keywords_fallback():
     assert _bridge.use_rust()

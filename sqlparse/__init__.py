@@ -32,7 +32,8 @@ def parse(
     if text is not None and _bridge.use_rust():
         from sqlparse import _sqlparse
 
-        return tuple(_bridge.assemble(s) for s in _sqlparse.parse_flat(text))
+        # The extension builds genuine `sql.py` objects directly.
+        return tuple(_sqlparse.parse_flat(text))
     return tuple(parsestream(sql, encoding))
 
 
@@ -57,10 +58,9 @@ def parsestream(
 
 def _parsestream_rust(text: str) -> Generator[sql.Statement, None, None]:
     """Rust-backed statement generator (lazy like `FilterStack.run`)."""
-    from sqlparse import _bridge, _sqlparse
+    from sqlparse import _sqlparse
 
-    for node in _sqlparse.parse_flat(text):
-        yield _bridge.assemble(node)
+    yield from _sqlparse.parse_flat(text)
 
 
 def format(sql: str, encoding: str | None = None, **options: Any) -> str:

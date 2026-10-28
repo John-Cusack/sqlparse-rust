@@ -6,7 +6,7 @@
 //! (prefix = upstream `in`); exact-type checks use `==` (upstream `is`).
 
 use crate::lexer::RawTok;
-use crate::tables_gen::TType;
+pub use crate::tables_gen::TType;
 
 pub const MAX_GROUPING_DEPTH: u32 = 100;
 pub const MAX_GROUPING_TOKENS: usize = 10000;

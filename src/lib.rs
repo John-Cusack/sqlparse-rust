@@ -7,7 +7,7 @@
 //! objects and core indices. No `unsafe` in this port.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyString, PyTuple};
+use pyo3::types::{PyList, PyString};
 use sqlparse_rust_core::{format, group, lexer, split, tree};
 
 /// Raise the facade's own `sqlparse.exceptions.SQLParseError` (kept
@@ -23,35 +23,75 @@ fn parse_error(py: Python<'_>, msg: String) -> PyErr {
     }
 }
 
-fn node_to_py<'py>(
+/// Per-call cache of `tokens.X` objects and `sql.*` classes, resolved by
+/// dotted path exactly like the facade used to.
+struct Resolver<'py> {
     py: Python<'py>,
+    tokens_mod: Bound<'py, PyModule>,
+    ttype_cache: std::collections::HashMap<u16, PyObject>,
+    class_cache: std::collections::HashMap<&'static str, PyObject>,
+}
+
+impl<'py> Resolver<'py> {
+    fn new(py: Python<'py>) -> PyResult<Self> {
+        Ok(Resolver {
+            py,
+            tokens_mod: py.import("sqlparse.tokens")?,
+            ttype_cache: std::collections::HashMap::new(),
+            class_cache: std::collections::HashMap::new(),
+        })
+    }
+
+    fn ttype(&mut self, t: tree::TType) -> PyResult<PyObject> {
+        let key = t as u16;
+        if let Some(o) = self.ttype_cache.get(&key) {
+            return Ok(o.clone_ref(self.py));
+        }
+        let mut obj = self.tokens_mod.getattr("Token")?;
+        for part in t.as_str().split('.').skip(1) {
+            obj = obj.getattr(part)?;
+        }
+        let o = obj.unbind();
+        self.ttype_cache.insert(key, o.clone_ref(self.py));
+        Ok(o)
+    }
+
+    fn class(&mut self, sql_mod: &Bound<'py, PyModule>, kind: GroupKindName) -> PyResult<PyObject> {
+        if let Some(o) = self.class_cache.get(kind.0) {
+            return Ok(o.clone_ref(self.py));
+        }
+        let o: PyObject = sql_mod.getattr(kind.0)?.unbind();
+        self.class_cache.insert(kind.0, o.clone_ref(self.py));
+        Ok(o)
+    }
+}
+
+struct GroupKindName(&'static str);
+
+/// Build a genuine `sql.py` object directly (no intermediate tuples, so
+/// peak RSS is the tree itself, like pure Python).
+fn build_node<'py>(
+    py: Python<'py>,
+    res: &mut Resolver<'py>,
+    sql_mod: &Bound<'py, PyModule>,
     text: &str,
     node: &tree::Node,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> PyResult<PyObject> {
     match node {
         tree::Node::Tok { ttype, start, end } => {
-            let t = PyTuple::new(
-                py,
-                [
-                    PyString::new(py, ttype.as_str()).into_any(),
-                    PyString::new(py, &text[*start as usize..*end as usize]).into_any(),
-                ],
-            )?;
-            Ok(t.into_any())
+            let cls: PyObject = sql_mod.getattr("Token")?.unbind();
+            let tt = res.ttype(*ttype)?;
+            let v = PyString::new(py, &text[*start as usize..*end as usize]);
+            Ok(cls.call1(py, (tt, v))?)
         }
         tree::Node::Grp { kind, kids, .. } => {
-            let items: Vec<Bound<'py, PyAny>> = kids
-                .iter()
-                .map(|k| node_to_py(py, text, k))
-                .collect::<PyResult<_>>()?;
-            let t = PyTuple::new(
-                py,
-                [
-                    PyString::new(py, kind.as_str()).into_any(),
-                    PyList::new(py, items)?.into_any(),
-                ],
-            )?;
-            Ok(t.into_any())
+            let mut items = Vec::with_capacity(kids.len());
+            for k in kids {
+                items.push(build_node(py, res, sql_mod, text, k)?);
+            }
+            let list = PyList::new(py, items)?;
+            let cls = res.class(sql_mod, GroupKindName(kind.as_str()))?;
+            Ok(cls.call1(py, (list,))?)
         }
     }
 }
@@ -60,10 +100,8 @@ fn node_to_py<'py>(
 /// The facade wraps this in `iter()` to match `get_tokens` laziness shape.
 #[pyfunction]
 fn tokenize_flat(text: &str) -> Vec<(String, String)> {
-    let lexed = lexer::lex(text);
-    lexed
-        .toks
-        .iter()
+    let toks = lexer::lex(text);
+    toks.iter()
         .map(|t| {
             (
                 t.ttype.as_str().to_owned(),
@@ -73,15 +111,16 @@ fn tokenize_flat(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Grouped statements as nested `(kind_or_ttype, payload)` tuples.
-/// Leaf = `(ttype_path, value)`; group = `(kind, [children])`.
-/// Errors surface as `sqlparse.exceptions.SQLParseError` with the exact
-/// upstream messages (`Maximum grouping depth exceeded (100).`, ...).
+/// Grouped statements as genuine `sql.py` objects (same classes the pure
+/// path builds). Errors surface as `sqlparse.exceptions.SQLParseError`
+/// with the exact upstream messages.
 #[pyfunction]
 fn parse_flat(py: Python<'_>, text: &str) -> PyResult<Vec<PyObject>> {
-    let lexed = lexer::lex(text);
+    let toks = lexer::lex(text);
     let mut splitter = split::Splitter::new();
-    let stmts = splitter.split(text, &lexed.toks);
+    let stmts = splitter.split(text, &toks);
+    let sql_mod = py.import("sqlparse.sql")?;
+    let mut res = Resolver::new(py)?;
     let mut out = Vec::with_capacity(stmts.len());
     for stmt in &stmts {
         let mut kids: Vec<tree::Node> = stmt
@@ -90,18 +129,13 @@ fn parse_flat(py: Python<'_>, text: &str) -> PyResult<Vec<PyObject>> {
             .collect();
         group::group_stmt(text, &mut kids)
             .map_err(|e| parse_error(py, e.message()))?;
-        let items: Vec<Bound<'_, PyAny>> = kids
-            .iter()
-            .map(|k| node_to_py(py, text, k))
-            .collect::<PyResult<_>>()?;
-        let stmt_tup = PyTuple::new(
-            py,
-            [
-                PyString::new(py, "Statement").into_any(),
-                PyList::new(py, items)?.into_any(),
-            ],
-        )?;
-        out.push(stmt_tup.into_any().unbind());
+        let mut items = Vec::with_capacity(kids.len());
+        for k in &kids {
+            items.push(build_node(py, &mut res, &sql_mod, text, k)?);
+        }
+        let list = PyList::new(py, items)?;
+        let cls = res.class(&sql_mod, GroupKindName("Statement"))?;
+        out.push(cls.call1(py, (list,))?);
     }
     Ok(out)
 }
@@ -190,9 +224,9 @@ fn format_flat(
 #[pyfunction]
 #[pyo3(signature = (text, strip_semicolon = false))]
 fn split_flat(text: &str, strip_semicolon: bool) -> Vec<String> {
-    let lexed = lexer::lex(text);
+    let toks = lexer::lex(text);
     let mut splitter = split::Splitter::new();
-    let stmts = splitter.split(text, &lexed.toks);
+    let stmts = splitter.split(text, &toks);
     stmts
         .iter()
         .map(|toks| {

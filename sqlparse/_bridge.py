@@ -18,7 +18,6 @@ import io
 import os
 
 _TTYPE_CACHE = {}
-_CLASS_CACHE = {}
 
 
 def coerce_text(stream, encoding=None):
@@ -99,18 +98,3 @@ def resolve_ttype(path):
         obj = getattr(obj, part)
     _TTYPE_CACHE[path] = obj
     return obj
-
-
-def assemble(node):
-    """Build genuine `sql.py` objects from one core `(kind, payload)` tuple."""
-    from sqlparse import sql
-
-    kind, payload = node
-    if isinstance(payload, list):
-        try:
-            cls = _CLASS_CACHE[kind]
-        except KeyError:
-            cls = getattr(sql, kind)
-            _CLASS_CACHE[kind] = cls
-        return cls([assemble(c) for c in payload])
-    return sql.Token(resolve_ttype(kind), payload)

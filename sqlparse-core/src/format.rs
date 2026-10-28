@@ -1531,7 +1531,7 @@ pub fn format_text(text: &str, opts: &FormatOptions) -> Result<String, FormatErr
         || opts.reindent
         || opts.reindent_aligned
         || opts.right_margin.is_some();
-    let (text2, toks2) = preprocess(text, &crate::lexer::lex(text).toks, opts);
+    let (text2, toks2) = preprocess(text, &crate::lexer::lex(text), opts);
     let mut splitter = crate::split::Splitter::new();
     let stmts = splitter.split(&text2, &toks2);
     let mut state = ReindentState { last_render: None, count: 0 };
