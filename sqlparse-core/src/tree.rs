@@ -81,13 +81,20 @@ impl GroupKind {
         }
     }
 }
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Node {
     Tok { ttype: TType, start: u32, end: u32 },
-    Grp { kind: GroupKind, kids: Vec<Node> },
+    Grp { kind: GroupKind, kids: Vec<Node>, id: u64 },
 }
 
+/// Stable group identities for snapshot-iteration live lookup (mirrors
+/// CPython object identity across splices). Counter only, no shared state.
+static NEXT_GRP_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub fn fresh_grp_id() -> u64 {
+    NEXT_GRP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 impl Node {
     pub fn is_group(&self) -> bool {
         matches!(self, Node::Grp { .. })
@@ -207,6 +214,9 @@ pub enum ImtT {
 }
 
 /// Mirrors `utils.imt` (None-safe; instance, then match, then ttype).
+/// ttype rule: single `_TokenType` → prefix containment (`in`); tuple of
+/// `_TokenType`s → tuple membership is EXACT per element (e.g. `(Operator,
+/// Wildcard)` excludes `Comparison`).
 pub fn imt(text: &str, n: Option<&Node>, i: ImtI, m: ImtM<'_>, t: ImtT) -> bool {
     let node = match n {
         Some(v) => v,
@@ -225,14 +235,14 @@ pub fn imt(text: &str, n: Option<&Node>, i: ImtI, m: ImtM<'_>, t: ImtT) -> bool 
         }
         ImtI::None => {}
     }
-    match m {
-        ImtM::One(tt, ref v) => {
-            if tok_match(text, node, tt, match_val_clone(v)) {
+    match &m {
+        ImtM::One(tt, v) => {
+            if tok_match(text, node, *tt, match_val_clone(v)) {
                 return true;
             }
         }
         ImtM::Many(ps) => {
-            for (tt, v) in ps {
+            for (tt, v) in ps.iter() {
                 if tok_match(text, node, *tt, match_val_clone(v)) {
                     return true;
                 }
@@ -247,7 +257,7 @@ pub fn imt(text: &str, n: Option<&Node>, i: ImtI, m: ImtM<'_>, t: ImtT) -> bool 
             }
         }
         ImtT::Many(tts) => {
-            if matches!(node, Node::Tok { ttype, .. } if tts.iter().any(|tt| ttype.is_in(*tt))) {
+            if matches!(node, Node::Tok { ttype, .. } if tts.iter().any(|tt| ttype == tt)) {
                 return true;
             }
         }
@@ -358,6 +368,10 @@ pub fn token_not_matching(
 /// Splice `kids[from..to]` into a new `kind` group, or graft onto an
 /// existing adjacent group when `extend` (mirrors `group_tokens`,
 /// `include_end=True` at all grouping call sites).
+///
+/// The `extend` check is `isinstance(start, grp_cls)`: `TokenList` as target
+/// grafts into *any* group (every group class subclasses it), keeping the
+/// existing kind; other targets graft only into their own kind.
 pub fn group_tokens(
     kids: &mut Vec<Node>,
     kind: GroupKind,
@@ -366,7 +380,9 @@ pub fn group_tokens(
     extend: bool,
 ) {
     let end = to + 1;
-    if extend && matches!(kids.get(from), Some(Node::Grp { kind: k, .. }) if *k == kind) {
+    let graft = extend
+        && matches!(&kids[from], Node::Grp { kind: k, .. } if *k == kind || kind == GroupKind::TokenList);
+    if graft {
         let mut tail = kids.split_off(end.min(kids.len()));
         let mut graft: Vec<Node> = kids.split_off(from + 1);
         if let Some(Node::Grp { kids: g, .. }) = kids.last_mut() {
@@ -374,9 +390,8 @@ pub fn group_tokens(
         }
         kids.append(&mut tail);
     } else {
-        let mut sub: Vec<Node> = kids.drain(from..end.min(kids.len())).collect();
-        let _ = &mut sub;
-        kids.insert(from, Node::Grp { kind, kids: sub });
+        let sub: Vec<Node> = kids.drain(from..end.min(kids.len())).collect();
+        kids.insert(from, Node::Grp { kind, kids: sub, id: fresh_grp_id() });
     }
 }
 

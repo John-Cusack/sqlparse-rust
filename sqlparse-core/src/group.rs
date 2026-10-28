@@ -79,8 +79,11 @@ fn match_val_clone<'a>(v: &MatchVal<'a>) -> MatchVal<'a> {
     }
 }
 
-/// Generic join pass mirroring `_group`. `vp`/`vn` close over the input
-/// text; `post` receives it explicitly.
+/// Generic join pass mirroring `_group`, including its snapshot iteration:
+/// `token_list = list(tlist)` is frozen at entry while `tidx = idx - offset`
+/// maps into the live list, so consumed (stale) tokens keep voting on
+/// `match`/valid and reset `pidx` — the nesting mechanism. `vp`/`vn` close
+/// over the input text; `post` receives it explicitly.
 #[allow(clippy::too_many_arguments)]
 fn group(
     text: &str,
@@ -100,37 +103,65 @@ fn group(
     if let Some(e) = toks_err(kids) {
         return Err(e);
     }
+    // Frozen value snapshot (spans only — cheap); live nav by mapped index.
+    let snap: Vec<Node> = kids.clone();
+    let mut offset: isize = 0;
     let mut pidx: Option<usize> = None;
-    let mut pos = 0;
-    while pos < kids.len() {
-        if is_ws(&kids[pos]) {
-            pos += 1;
+    let mut prev: Option<Node> = None;
+    for (idx, stok) in snap.iter().enumerate() {
+        let ti = idx as isize - offset;
+        if ti < 0 {
             continue;
         }
-        if recurse_flag
-            && kids[pos].is_group()
-            && !matches!(&kids[pos], Node::Grp { kind: k, .. } if *k == kind)
-        {
-            if let Node::Grp { kids: sub, .. } = &mut kids[pos] {
+        let ti = ti as usize;
+        if is_ws_node(stok) {
+            continue;
+        }
+        if recurse_flag && stok.is_group() && !matches!(stok, Node::Grp { kind: k, .. } if *k == kind) {
+            let gid = match stok {
+                Node::Grp { id, .. } => *id,
+                _ => unreachable!(),
+            };
+            if let Some(sub) = find_group_kids(kids, gid) {
                 group(text, sub, kind, m, vp, vn, post, extend, true, depth + 1)?;
             }
         }
-        if m(text, &kids[pos]) {
-            let nidx = token_next(kids, Some(pos), true, false);
-            let prev_ok = pidx.is_some_and(|i| vp(Some(&kids[i])));
+        if m(text, stok) {
+            let nidx = token_next(kids, Some(ti), true, false);
+            let prev_ok = prev.as_ref().is_some_and(|p| vp(Some(p)));
             let next_ok = vn(nidx.map(|i| &kids[i]));
-            if pidx.is_some() && prev_ok && next_ok {
-                let (from, to) = post(text, kids, pidx.unwrap(), pos, nidx);
+            if prev.is_some() && prev_ok && next_ok {
+                let (from, to) = post(text, kids, pidx.unwrap(), ti, nidx);
                 group_tokens(kids, kind, from, to, extend);
+                offset += to as isize - from as isize;
                 pidx = Some(from);
-                pos = from + 1;
+                prev = Some(kids[from].clone());
                 continue;
             }
         }
-        pidx = Some(pos);
-        pos += 1;
+        pidx = Some(ti);
+        prev = Some(stok.clone());
     }
     Ok(())
+}
+
+fn is_ws_node(n: &Node) -> bool {
+    matches!(n, Node::Tok { ttype, .. } if ttype.is_in(TType::TOKEN_TEXT_WHITESPACE))
+}
+
+/// Locate a live group subtree by stable id (DFS; absorbed groups nest).
+fn find_group_kids<'a>(kids: &'a mut Vec<Node>, id: u64) -> Option<&'a mut Vec<Node>> {
+    for n in kids.iter_mut() {
+        if let Node::Grp { id: gid, kids: sub, .. } = n {
+            if *gid == id {
+                return Some(sub);
+            }
+            if let Some(r) = find_group_kids(sub, id) {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
 
 /// Iterative post-order `@recurse` traversal: apply `f` to every level
@@ -152,7 +183,7 @@ fn recurse(
         }
     }
     for i in idxs {
-        if let Node::Grp { kind: k, kids: sub } = &mut kids[i] {
+        if let Node::Grp { kind: k, kids: sub, .. } = &mut kids[i] {
             let k = *k;
             recurse(text, k, sub, skip, f)?;
         }
@@ -167,6 +198,7 @@ const I_SQ_ID_FN: &[GroupKind] =
 const I_PAR_FN_ID_OP_CMP: &[GroupKind] = &[
     GroupKind::Parenthesis,
     GroupKind::Function,
+    GroupKind::Case,
     GroupKind::Identifier,
     GroupKind::Operation,
     GroupKind::Comparison,

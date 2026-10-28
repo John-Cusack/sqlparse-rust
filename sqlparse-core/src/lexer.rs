@@ -302,7 +302,8 @@ fn match_rule(idx: usize, ch: &[char], pos: usize) -> Option<usize> {
                 }
                 p += 1;
             }
-            (c(p) == 's').then(|| p + 1 - pos)
+            // Trailing `s` is IGNORECASE (matches ſ etc., like CPython).
+            (p < ch.len() && eq_ci('s', c(p))).then(|| p + 1 - pos)
         }
         // 11: (?<!\w)[$:?]\w+ placeholder.
         11 => {

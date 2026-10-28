@@ -39,9 +39,11 @@ fn node_to_py<'py>(
             )?;
             Ok(t.into_any())
         }
-        tree::Node::Grp { kind, kids } => {
-            let items: Vec<Bound<'py, PyAny>> =
-                kids.iter().map(|k| node_to_py(py, text, k)).collect::<PyResult<_>>()?;
+        tree::Node::Grp { kind, kids, .. } => {
+            let items: Vec<Bound<'py, PyAny>> = kids
+                .iter()
+                .map(|k| node_to_py(py, text, k))
+                .collect::<PyResult<_>>()?;
             let t = PyTuple::new(
                 py,
                 [

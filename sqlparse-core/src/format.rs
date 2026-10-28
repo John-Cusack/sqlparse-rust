@@ -46,7 +46,8 @@ enum NKind {
 struct ANode {
     ttype: Option<TType>,
     kind: NKind,
-    text: String, // leaves only
+    text: String, // leaves: live value
+    frozen: String, // groups: value frozen at build (+grafts); mirrors TokenList.value
     kids: Vec<usize>,
     parent: Option<usize>,
 }
@@ -67,11 +68,11 @@ impl Arena {
     }
 
     fn leaf(&mut self, ttype: TType, text: String, parent: Option<usize>) -> usize {
-        self.push(ANode { ttype: Some(ttype), kind: NKind::Tok, text, kids: Vec::new(), parent })
+        self.push(ANode { ttype: Some(ttype), kind: NKind::Tok, text, frozen: String::new(), kids: Vec::new(), parent })
     }
 
     fn group(&mut self, kind: GroupKind, parent: Option<usize>) -> usize {
-        self.push(ANode { ttype: None, kind: NKind::Grp(kind), text: String::new(), kids: Vec::new(), parent })
+        self.push(ANode { ttype: None, kind: NKind::Grp(kind), text: String::new(), frozen: String::new(), kids: Vec::new(), parent })
     }
 
     fn from_tree(&mut self, text: &str, kids: &[tree::Node], parent: Option<usize>) -> Vec<usize> {
@@ -81,10 +82,14 @@ impl Arena {
                 tree::Node::Tok { ttype, start, end } => {
                     out.push(self.leaf(*ttype, text[*start as usize..*end as usize].to_owned(), parent));
                 }
-                tree::Node::Grp { kind, kids: sub } => {
+                tree::Node::Grp { kind, kids: sub, .. } => {
                     let id = self.group(*kind, parent);
                     let c = self.from_tree(text, sub, Some(id));
                     self.nodes[id].kids = c;
+                    // Frozen at build (= Python's .value after grouping);
+                    // later leaf mutations/inserts never update it.
+                    let live = self.group_text_live(id);
+                    self.nodes[id].frozen = live;
                     out.push(id);
                 }
             }
@@ -120,15 +125,25 @@ impl Arena {
             None => self.kind_is(id, GroupKind::Comment),
         }
     }
-    /// `imt` over arena nodes: group-kind match OR (ttype [, values]) match.
-    fn imt_node(&self, id: usize, kinds: &[GroupKind], t: Option<(TType, Option<MatchVal<'_>>)>) -> bool {
+    /// `imt` over arena nodes: group-kind match OR `m` (exact type +
+    /// values, like `Token.match`) OR `t` (bare containment, like imt's
+    /// t-branch: prefix, never values).
+    fn imt_node(
+        &self, id: usize, kinds: &[GroupKind],
+        m: Option<(TType, MatchVal<'_>)>, t: Option<TType>,
+    ) -> bool {
         if !kinds.is_empty()
             && matches!(self.nodes[id].kind, NKind::Grp(k) if kinds.contains(&k))
         {
             return true;
         }
-        if let Some((tt, mv)) = t {
-            if self.tok_match(id, tt, mv) {
+        if let Some((tt, mv)) = m {
+            if self.tok_match(id, tt, Some(mv)) {
+                return true;
+            }
+        }
+        if let Some(tt) = t {
+            if matches!(self.nodes[id].ttype, Some(t) if t.is_in(tt)) {
                 return true;
             }
         }
@@ -153,12 +168,14 @@ impl Arena {
 
     fn next_by(
         &self, parent: usize, start: isize, kinds: &[GroupKind],
-        t: Option<(TType, Option<MatchVal<'_>>)>,
+        m: Option<(TType, MatchVal<'_>)>, t: Option<TType>,
     ) -> Option<usize> {
         let kids = &self.nodes[parent].kids;
         let mut i = (start + 1).max(0) as usize;
         while i < kids.len() {
-            if self.imt_node(kids[i], kinds, t.clone()) {
+            // MatchVal is Copy (all payloads are), so reborrow per probe.
+            let mm = m.clone();
+            if self.imt_node(kids[i], kinds, mm, t) {
                 return Some(i);
             }
             i += 1;
@@ -235,15 +252,36 @@ impl Arena {
     }
 
     /// Flat-text of a node (live concat for groups, mirrors `str(token)`).
-    fn group_text(&self, id: usize) -> String {
+    fn group_text_live(&self, id: usize) -> String {
         let mut out = String::new();
         self.render_into(id, &mut out);
         out
     }
 
+    /// Frozen group text (mirrors `TokenList.value`: join at creation, plus
+    /// graft-appends; leaf mutations/inserts never update it). For leaves
+    /// this is just the live text.
+    fn group_value(&self, id: usize) -> String {
+        if self.is_group(id) {
+            self.nodes[id].frozen.clone()
+        } else {
+            self.nodes[id].text.clone()
+        }
+    }
+
     fn insert_at(&mut self, parent: usize, idx: usize, child: usize) {
         self.nodes[parent].kids.insert(idx, child);
         self.nodes[child].parent = Some(parent);
+    }
+
+    /// Mirrors `insert_after` (default `skip_ws=True`): insert before the
+    /// next non-whitespace, or append when there is none.
+    fn insert_after(&mut self, parent: usize, idx: usize, child: usize) {
+        self.nodes[child].parent = Some(parent);
+        match self.next(parent, idx, true, false) {
+            Some(ni) => self.nodes[parent].kids.insert(ni, child),
+            None => self.nodes[parent].kids.push(child),
+        }
     }
 
     fn remove_at(&mut self, parent: usize, idx: usize) {
@@ -288,8 +326,8 @@ fn preprocess(
         let mut val = if opts.keyword_case != 0 && t.ttype.is_in(TType::TOKEN_KEYWORD) {
             apply_case(v, opts.keyword_case)
         } else if opts.identifier_case != 0
-            && (t.ttype.is_in(TType::TOKEN_NAME)
-                || t.ttype.is_in(TType::TOKEN_LITERAL_STRING_SYMBOL))
+            && (t.ttype == TType::TOKEN_NAME
+                || t.ttype == TType::TOKEN_LITERAL_STRING_SYMBOL)
             && v.trim().chars().next() != Some('"')
         {
             // Upstream indexes `value.strip()[0]` (panics on all-ws, which
@@ -339,7 +377,7 @@ fn strip_comments(arena: &mut Arena, parent: usize) {
     for s in subs {
         strip_comments(arena, s);
     }
-    let mut tidx = arena.next_by(parent, -1, &[GroupKind::Comment], Some((TType::TOKEN_COMMENT, None)));
+    let mut tidx = arena.next_by(parent, -1, &[GroupKind::Comment], None, Some(TType::TOKEN_COMMENT));
     while let Some(t) = tidx {
         let tok = arena.nodes[parent].kids[t];
         let is_hint = arena.nodes[tok].ttype.is_some_and(|tt| {
@@ -351,7 +389,7 @@ fn strip_comments(arena: &mut Arena, parent: usize) {
                 })
             }));
         if is_hint {
-            tidx = arena.next_by(parent, t as isize, &[GroupKind::Comment], Some((TType::TOKEN_COMMENT, None)));
+            tidx = arena.next_by(parent, t as isize, &[GroupKind::Comment], None, Some(TType::TOKEN_COMMENT));
             continue;
         }
         let p = arena.prev(parent, t, false, false);
@@ -379,21 +417,21 @@ fn strip_comments(arena: &mut Arena, parent: usize) {
             }
             tidx = if t == 0 { None } else { Some(t - 1) };
             tidx = match tidx {
-                None => arena.next_by(parent, -1, &[GroupKind::Comment], Some((TType::TOKEN_COMMENT, None))),
-                Some(i) => arena.next_by(parent, i as isize, &[GroupKind::Comment], Some((TType::TOKEN_COMMENT, None))),
+                None => arena.next_by(parent, -1, &[GroupKind::Comment], None, Some(TType::TOKEN_COMMENT)),
+                Some(i) => arena.next_by(parent, i as isize, &[GroupKind::Comment], None, Some(TType::TOKEN_COMMENT)),
             };
         } else {
             let ins = insert_token_for(arena, parent, tok);
             arena.nodes[parent].kids[t] = ins;
             arena.nodes[ins].parent = Some(parent);
-            tidx = arena.next_by(parent, t as isize, &[GroupKind::Comment], Some((TType::TOKEN_COMMENT, None)));
+            tidx = arena.next_by(parent, t as isize, &[GroupKind::Comment], None, Some(TType::TOKEN_COMMENT));
         }
     }
 }
 
 /// `_get_insert_token`: newline run preserved (issue484) else one space.
 fn insert_token_for(arena: &mut Arena, parent: usize, tok: usize) -> usize {
-    let v = arena.group_text(tok);
+    let v = arena.group_value(tok);
     let tail = v.trim_end_matches(' ');
     let nl_run: String = tail.chars().rev().take_while(|&c| c == '\r' || c == '\n').collect::<Vec<_>>().into_iter().rev().collect();
     if nl_run.is_empty() {
@@ -491,7 +529,7 @@ fn spaces_around_operators(arena: &mut Arena, parent: usize) {
             arena.nodes[arena.nodes[parent].kids[n]].ttype != Some(TType::TOKEN_TEXT_WHITESPACE)
         }) {
             let w = ws_leaf(arena, parent, " ");
-            arena.insert_at(parent, i + 1, w);
+            arena.insert_after(parent, i, w);
         }
         if arena.prev(parent, i, false, false).is_some_and(|p| {
             arena.nodes[arena.nodes[parent].kids[p]].ttype != Some(TType::TOKEN_TEXT_WHITESPACE)
@@ -632,7 +670,9 @@ impl<'a> Reindent<'a> {
         &self, arena: &Arena, parent: usize, skip_ws: bool,
     ) -> Vec<(Option<Vec<usize>>, Vec<usize>)> {
         let mut ret: Vec<(Option<Vec<usize>>, Vec<usize>)> = Vec::new();
-        let mut mode: Option<bool> = None; // true = condition
+        // Upstream starts in CONDITION mode (leading tokens before the
+        // first WHEN open the first pair).
+        let mut mode: Option<bool> = Some(true); // true = condition
         for &k in &arena.nodes[parent].kids.clone() {
             if arena.tok_match(k, TType::TOKEN_KEYWORD, Some(MatchVal::One("CASE")))
                 || (skip_ws
@@ -691,14 +731,14 @@ impl<'a> Reindent<'a> {
             arena.norm_eq(k, "BETWEEN")
         }) {
             let i = r.unwrap();
-            let (_, r2) = self.next_token(arena, parent, i as isize);
+            let (r2, _) = self.next_token(arena, parent, i as isize);
             r = r2;
             if r.is_some_and(|j| {
                 let k = arena.nodes[parent].kids[j];
                 arena.norm_eq(k, "AND")
             }) {
                 let j = r.unwrap();
-                let (_, r3) = self.next_token(arena, parent, j as isize);
+                let (r3, _) = self.next_token(arena, parent, j as isize);
                 r = r3;
             }
         }
@@ -715,12 +755,15 @@ impl<'a> Reindent<'a> {
         let mut i = (idx + 1).max(0) as usize;
         while i < kids.len() {
             let k = kids[i];
-            if matches!(arena.nodes[k].ttype, Some(t) if t.is_in(TType::TOKEN_KEYWORD))
+            // Upstream `match` uses `is` (exact): DML/DDL/Order never match here.
+            if matches!(arena.nodes[k].ttype, Some(t) if t == TType::TOKEN_KEYWORD)
                 && words.iter().any(|w| {
+                    // All 14 entries compile as regexes and `search` (regex=True):
+                    // plain words match anywhere, `$` words anchor at the end.
                     if let Some(p) = w.strip_suffix('$') {
                         arena.nodes[k].text.to_uppercase().ends_with(p)
                     } else {
-                        arena.norm_eq(k, w)
+                        arena.nodes[k].text.to_uppercase().contains(w)
                     }
                 })
             {
@@ -736,7 +779,7 @@ impl<'a> Reindent<'a> {
         while let Some(i) = t {
             if let Some(p) = arena.prev(parent, i, false, false) {
                 let pid = arena.nodes[parent].kids[p];
-                let uprev = arena.group_text(pid);
+                let uprev = arena.group_text_live(pid);
                 if arena.is_ws(pid) {
                     arena.remove_at(parent, p);
                     // Token shifted left to ni; insert before it unless the
@@ -746,10 +789,10 @@ impl<'a> Reindent<'a> {
                         let n = self.nl(arena, parent, 0);
                         arena.insert_at(parent, ni, n);
                         // Token now at ni + 1; continue after it.
-                        let (_, nt) = self.next_token(arena, parent, (ni + 1) as isize);
+                        let (nt, _) = self.next_token(arena, parent, (ni + 1) as isize);
                         t = nt;
                     } else {
-                        let (_, nt) = self.next_token(arena, parent, ni as isize);
+                        let (nt, _) = self.next_token(arena, parent, ni as isize);
                         t = nt;
                     }
                     continue;
@@ -758,7 +801,7 @@ impl<'a> Reindent<'a> {
                     let n = self.nl(arena, parent, 0);
                     arena.insert_at(parent, i, n);
                     // Token now at i + 1; continue after it.
-                    let (_, nt) = self.next_token(arena, parent, (i + 1) as isize);
+                    let (nt, _) = self.next_token(arena, parent, (i + 1) as isize);
                     t = nt;
                     continue;
                 }
@@ -766,11 +809,11 @@ impl<'a> Reindent<'a> {
                 // prev is None: uprev is str(None) == 'None', never newline-y.
                 let n = self.nl(arena, parent, 0);
                 arena.insert_at(parent, i, n);
-                let (_, nt) = self.next_token(arena, parent, (i + 1) as isize);
+                let (nt, _) = self.next_token(arena, parent, (i + 1) as isize);
                 t = nt;
                 continue;
             }
-            let (_, nt) = self.next_token(arena, parent, (i + 1) as isize);
+            let (nt, _) = self.next_token(arena, parent, (i + 1) as isize);
             t = nt;
         }
     }
@@ -833,7 +876,7 @@ impl<'a> Reindent<'a> {
     }
 
     fn process_where(&mut self, arena: &mut Arena, id: usize) {
-        let t = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD, Some(MatchVal::One("WHERE")))));
+        let t = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD, MatchVal::One("WHERE"))), None);
         if t.is_none() {
             return;
         }
@@ -847,7 +890,7 @@ impl<'a> Reindent<'a> {
 
     fn process_parenthesis(&mut self, arena: &mut Arena, id: usize) {
         let is_dml = arena.next_by_either(id, -1, TType::TOKEN_KEYWORD_DML, TType::TOKEN_KEYWORD_DDL).is_some();
-        let f = arena.next_by(id, -1, &[], Some((TType::TOKEN_PUNCTUATION, Some(MatchVal::One("(")))));
+        let f = arena.next_by(id, -1, &[], Some((TType::TOKEN_PUNCTUATION, MatchVal::One("("))), None);
         let first = match f {
             Some(x) => x,
             None => return,
@@ -856,11 +899,13 @@ impl<'a> Reindent<'a> {
         if is_dml {
             self.indent += 1;
         }
+        // Capture the node id: the insert below shifts indices.
+        let first_id = arena.nodes[id].kids[first];
         if is_dml {
             let n = self.nl(arena, id, 0);
             arena.insert_at(id, 0, n);
         }
-        let off = self.get_offset(arena, arena.nodes[id].kids[first]) + 1;
+        let off = self.get_offset(arena, first_id) + 1;
         let so = self.offset;
         self.offset += off;
         self.process_default(arena, id, !is_dml);
@@ -888,7 +933,7 @@ impl<'a> Reindent<'a> {
             self.offset += num_offset;
             let mut position = 0usize;
             for &tok in &identifiers.clone() {
-                position += arena.group_text(tok).chars().count() + 1;
+                position += arena.group_value(tok).chars().count() + 1;
                 if position as isize > self.opts.wrap_after as isize - self.offset {
                     let mut adjust = 0isize;
                     let mut target = tok;
@@ -920,7 +965,7 @@ impl<'a> Reindent<'a> {
             self.offset = so;
         } else {
             for &tok in &arena.nodes[id].kids.clone() {
-                if arena.group_text(tok) == "," {
+                if arena.group_value(tok) == "," {
                     if arena.next(id, arena.position(id, tok).unwrap(), false, false).is_some_and(|n| {
                         !arena.is_ws(arena.nodes[id].kids[n])
                     }) {
@@ -931,14 +976,14 @@ impl<'a> Reindent<'a> {
                 }
             }
             let end_at = self.offset
-                + identifiers.iter().map(|&x| arena.group_text(x).chars().count() as isize + 1).sum::<isize>();
+                + identifiers.iter().map(|&x| arena.group_value(x).chars().count() as isize + 1).sum::<isize>();
             let mut adjusted = 0isize;
             if self.opts.wrap_after > 0
                 && end_at > self.opts.wrap_after as isize - self.offset
                 && self.last_func.is_some()
             {
                 let lf = self.last_func.unwrap();
-                adjusted = -(arena.group_text(lf).chars().count() as isize) - 1;
+                adjusted = -(arena.group_value(lf).chars().count() as isize) - 1;
             }
             let (sv_i, sv_o) = (self.indent, self.offset);
             self.offset += adjusted;
@@ -950,7 +995,7 @@ impl<'a> Reindent<'a> {
             }
             let mut position = 0usize;
             for &tok in &identifiers.clone() {
-                position += arena.group_text(tok).chars().count() + 1;
+                position += arena.group_value(tok).chars().count() + 1;
                 if self.opts.wrap_after > 0
                     && position as isize > self.opts.wrap_after as isize - self.offset
                 {
@@ -983,8 +1028,8 @@ impl<'a> Reindent<'a> {
         let so2 = self.offset;
         self.offset += first.map(|f| self.get_offset(arena, f)).unwrap_or(0);
         for (cond, value) in cases.iter().skip(1) {
-            let str_cond: String = cond.as_ref().map(|c| c.iter().map(|&x| arena.group_text(x)).collect()).unwrap_or_default();
-            let str_value: String = value.iter().map(|&x| arena.group_text(x)).collect();
+            let str_cond: String = cond.as_ref().map(|c| c.iter().map(|&x| arena.group_text_live(x)).collect()).unwrap_or_default();
+            let str_value: String = value.iter().map(|&x| arena.group_text_live(x)).collect();
             let end_pos = self.offset + 1 + str_cond.chars().count() as isize + str_value.chars().count() as isize;
             if !self.opts.compact && end_pos > self.opts.wrap_after as isize {
                 let target = match cond {
@@ -1004,7 +1049,7 @@ impl<'a> Reindent<'a> {
         self.offset += "WHEN ".len() as isize;
         self.process_default(arena, id, true);
         self.offset = so2;
-        let e = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD, Some(MatchVal::One("END")))));
+        let e = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD, MatchVal::One("END"))), None);
         if e.is_some() && !self.opts.compact {
             let n = self.nl(arena, id, 0);
             arena.insert_at(id, e.unwrap(), n);
@@ -1015,12 +1060,12 @@ impl<'a> Reindent<'a> {
     fn process_values(&mut self, arena: &mut Arena, id: usize) {
         let n = self.nl(arena, id, 0);
         arena.insert_at(id, 0, n);
-        let mut t = arena.next_by(id, -1, &[GroupKind::Parenthesis], None);
+        let mut t = arena.next_by(id, -1, &[GroupKind::Parenthesis], None, None);
         while let Some(i) = t {
             let first_token = arena.nodes[id].kids[i];
             let cur = arena.next_by(
                 id, i as isize, &[],
-                Some((TType::TOKEN_PUNCTUATION, Some(MatchVal::One(",")))),
+                Some((TType::TOKEN_PUNCTUATION, MatchVal::One(","))), None,
             );
             // Upstream loops while token: only the FIRST comma after each
             // parenthesis is consumed per iteration (single if, not while).
@@ -1033,11 +1078,11 @@ impl<'a> Reindent<'a> {
                 } else {
                     let off = self.get_offset(arena, arena.nodes[id].kids[i]);
                     let nn = self.nl(arena, id, off);
-                    arena.insert_at(id, p + 1, nn);
+                    arena.insert_after(id, p, nn);
                 }
                 let _ = cur;
             }
-            t = arena.next_by(id, i as isize, &[GroupKind::Parenthesis], None);
+            t = arena.next_by(id, i as isize, &[GroupKind::Parenthesis], None, None);
         }
     }
 
@@ -1060,7 +1105,7 @@ impl<'a> Reindent<'a> {
             let w = ws_leaf(arena, root, sep);
             arena.insert_at(root, 0, w);
         }
-        let out = arena.group_text(root);
+        let out = arena.group_text_live(root);
         self.last_render = Some(out.clone());
         out
     }
@@ -1110,20 +1155,15 @@ impl<'a> Aligned<'a> {
         let mut i = (idx + 1).max(0) as usize;
         while i < kids.len() {
             let k = kids[i];
-            if matches!(arena.nodes[k].ttype, Some(t) if t.is_in(TType::TOKEN_KEYWORD)) {
+            // Exact Keyword only (upstream `match` identity).
+            if matches!(arena.nodes[k].ttype, Some(t) if t == TType::TOKEN_KEYWORD) {
                 let up = arena.nodes[k].text.to_uppercase();
-                if up == "FROM"
-                    || up == "ON"
-                    || up == "WHERE"
-                    || up == "AND"
-                    || up == "OR"
-                    || up == "HAVING"
-                    || up == "LIMIT"
-                    || up == "UNION"
-                    || up == "VALUES"
-                    || up == "SET"
-                    || up == "BETWEEN"
-                    || up == "EXCEPT"
+                // All 14 split words compile as regexes and `search`
+                // (regex=True): plain words match anywhere.
+                if ["FROM", "ON", "WHERE", "AND", "OR", "HAVING", "LIMIT",
+                    "UNION", "VALUES", "SET", "BETWEEN", "EXCEPT"]
+                    .iter()
+                    .any(|w| up.contains(w))
                     || Self::match_join(&up)
                     || Self::match_by(&up)
                 {
@@ -1164,7 +1204,7 @@ impl<'a> Aligned<'a> {
     }
 
     fn process_parenthesis(&mut self, arena: &mut Arena, id: usize) {
-        let found = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD_DML, Some(MatchVal::One("SELECT")))));
+        let found = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD_DML, MatchVal::One("SELECT"))), None);
         if found.is_none() {
             return;
         }
@@ -1173,7 +1213,7 @@ impl<'a> Aligned<'a> {
         arena.insert_at(id, 1, s);
         self.process_default(arena, id);
         self.indent -= 1;
-        let n = self.nl(arena, id, AlignedOff::Int(0));
+        let n = self.nl(arena, id, AlignedOff::Int(1));
         let l = arena.nodes[id].kids.len();
         arena.insert_at(id, l - 1, n);
     }
@@ -1182,7 +1222,8 @@ impl<'a> Aligned<'a> {
         let ids: Vec<usize> = arena.nodes[id].kids.iter().copied()
             .filter(|&k| !arena.is_ws(k) && !arena.tok_match(k, TType::TOKEN_PUNCTUATION, Some(MatchVal::One(",")))).collect();
         for &tok in ids.iter().skip(1) {
-            let n = self.nl(arena, id, AlignedOff::Int(0));
+            // Upstream `nl()` defaults to offset=1 (one space after SELECT).
+            let n = self.nl(arena, id, AlignedOff::Int(1));
             let pos = arena.position(id, tok).unwrap();
             arena.insert_at(id, pos, n);
         }
@@ -1196,13 +1237,13 @@ impl<'a> Aligned<'a> {
             root: id, last_render: None, last_func: None,
         };
         let mut cases = re.get_cases(arena, id, true);
-        let end = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD, Some(MatchVal::One("END")))));
+        let end = arena.next_by(id, -1, &[], Some((TType::TOKEN_KEYWORD, MatchVal::One("END"))), None);
         if let Some(e) = end {
             cases.push((None, vec![arena.nodes[id].kids[e]]));
         }
         let widths: Vec<usize> = cases.iter().map(|(c, _)| {
             c.as_ref().map(|cc| {
-                cc.iter().map(|&x| arena.group_text(x)).collect::<Vec<_>>().join(" ").chars().count()
+                cc.iter().map(|&x| arena.group_text_live(x)).collect::<Vec<_>>().join(" ").chars().count()
             }).unwrap_or(0)
         }).collect();
         let maxw = widths.iter().copied().max().unwrap_or(0);
@@ -1216,7 +1257,7 @@ impl<'a> Aligned<'a> {
                 None => continue,
             };
             if i > 0 {
-                let n = self.nl(arena, id, AlignedOff::Int(10 - arena.group_text(stmt).chars().count() as isize));
+                let n = self.nl(arena, id, AlignedOff::Int(10 - arena.group_text_live(stmt).chars().count() as isize));
                 let pos = arena.position(id, stmt).unwrap();
                 arena.insert_at(id, pos, n);
             }
@@ -1240,7 +1281,7 @@ impl<'a> Aligned<'a> {
             let token_indent = if Self::match_join(&up) || Self::match_by(&up) {
                 up.split_whitespace().next().unwrap_or("").to_owned()
             } else {
-                arena.group_text(tok)
+                arena.group_text_live(tok)
             };
             let n = self.nl(arena, id, AlignedOff::Str(&token_indent));
             arena.insert_at(id, i, n);
@@ -1322,7 +1363,7 @@ fn output_wrap(arena: &Arena, root: usize, rendered: &str, output: u8, varname: 
                 }
                 continue;
             }
-            let raw = arena.group_text(k);
+            let raw = arena.group_value(k);
             push(&mut out, &raw.replace('\\', "\\\\").replace('\'', "\\'"));
         }
         push(&mut out, "'");
@@ -1354,7 +1395,7 @@ fn output_wrap(arena: &Arena, root: usize, rendered: &str, output: u8, varname: 
                 }
                 continue;
             }
-            let raw = arena.group_text(k);
+            let raw = arena.group_value(k);
             push(&mut out, &raw.replace('\\', "\\\\").replace('"', "\\\""));
         }
         push(&mut out, "\";");
@@ -1448,13 +1489,28 @@ fn format_one(
     if opts.right_margin.is_some() {
         return Err(FormatError::NotImplemented);
     }
-    let rendered = arena.group_text(root);
+    let rendered = arena.group_text_live(root);
+    // Upstream `OutputFilter._process` rebinds `stmt.tokens` to a one-shot
+    // generator that `SerializerUnicode` exhausts via `str()`: with output
+    // wrap, `_last_stmt` renders as `''` for every later statement (hence
+    // `\n\n`). Without wrap the tree stays intact (live render).
+    state.last_render = Some(if opts.output == 0 {
+        rendered.clone()
+    } else {
+        String::new()
+    });
     let wrapped = if opts.output == 0 {
         rendered
     } else {
         state.count += 1;
-        let varname = if opts.output == 2 { "$sql" } else { "sql" };
-        output_wrap(&arena, root, &rendered, opts.output, varname, state.count)
+        // `varname` / `varname{count}` exactly like `OutputFilter.process`.
+        let base = if opts.output == 2 { "$sql" } else { "sql" };
+        let vn = if state.count > 1 {
+            format!("{base}{}", state.count)
+        } else {
+            base.to_owned()
+        };
+        output_wrap(&arena, root, &rendered, opts.output, &vn, state.count)
     };
     // SerializerUnicode: rstrip each line, join with \n.
     let lines = split_unquoted(&wrapped);

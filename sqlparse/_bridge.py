@@ -71,7 +71,9 @@ def lexer_pristine():
     ]
     if inst._keywords != default_dicts:
         return False
-    if [rx.pattern for rx, _ in inst._SQL_REGEX] != [rx for rx, _ in keywords.SQL_REGEX]:
+    # `_SQL_REGEX` holds bound `Pattern.match` methods; compare the
+    # underlying patterns plus ttypes.
+    if [rx.__self__.pattern for rx, _ in inst._SQL_REGEX] != [rx for rx, _ in keywords.SQL_REGEX]:
         return False
     if [tt for _, tt in inst._SQL_REGEX] != [tt for _, tt in keywords.SQL_REGEX]:
         return False
