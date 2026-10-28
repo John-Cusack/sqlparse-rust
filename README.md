@@ -8,28 +8,28 @@ Rust port of [andialbrecht/sqlparse](https://github.com/andialbrecht/sqlparse)
 Status: landed — full upstream suite green (506 passed, 2 xfailed, 1 xpassed
 stale), differential fuzz + seam suites green, kill criteria passed.
 
-Measured speedups (release wheel, Ryzen 9 5950X, wall per call, rust vs
-pure in the same wheel; `benches/bench_two_track.py`):
+Measured speedups (release wheel, Ryzen 9 5950X; `benches/bench_two_track.py`):
+Wall is per-call best-of-3; RSS is subprocess peak (`ru_maxrss`), same
+installed wheel both sides (`SQLPARSE_PURE=1` selects pure).
 
-| workload | pure | rust | speedup |
-|---|---|---|---|
-| split-1x (~13 KB) | 27.9 ms | 3.8 ms | 7.3x |
-| split-8x (~106 KB) | 228 ms | 32 ms | 7.2x |
-| parse-1x | 87.0 ms | 20.3 ms | 4.3x |
-| parse-8x | 760 ms | 227 ms | 3.4x |
-| format-reindent-1x | 106 ms | 8.8 ms | 12.0x |
-| format-reindent-8x | 847 ms | 72 ms | 11.8x |
-| format-light-1x | 98 ms | 8.5 ms | 11.5x |
-| format-light-8x | 759 ms | 69 ms | 11.0x |
-| parse-single | 0.37 ms | 0.083 ms | 4.5x |
-| format-single | 0.53 ms | 0.049 ms | 10.7x |
+| workload | pure wall | rust wall | speedup | pure peak RSS | rust peak RSS |
+|---|---|---|---|---|---|
+| split-1x (~13 KB) | 31.0 ms | 4.2 ms | 7.4x | 12.4 MB | 13.7 MB |
+| split-8x (~106 KB) | 255 ms | 32 ms | 8.1x | 13.5 MB | 16.3 MB |
+| parse-1x | 91.1 ms | 15.9 ms | 5.7x | 20.5 MB | 24.0 MB |
+| parse-8x | 839 ms | 157 ms | 5.3x | 31.4 MB | 34.3 MB |
+| format-reindent-1x | 105 ms | 9.0 ms | 11.7x | 14.2 MB | 14.2 MB |
+| format-reindent-8x | 895 ms | 76 ms | 11.8x | 14.5 MB | 15.6 MB |
+| format-light-1x | 106 ms | 8.5 ms | 12.4x | 13.6 MB | 14.0 MB |
+| format-light-8x | 784 ms | 69 ms | 11.4x | 13.2 MB | 15.4 MB |
+| parse-single | 0.35 ms | 0.082 ms | 4.3x | 13.7 MB | 13.5 MB |
+| format-single | 0.47 ms | 0.044 ms | 10.6x | 12.9 MB | 13.0 MB |
 
-## Layout
-
-- `sqlparse-core/` — hot unit: default-config lexer (hand-written scanner,
-  50 patterns + delimited-span pre-scan + generated keyword tables) +
-  statement splitter + grouping engine (26 passes) + format engine (all
-  filters). No Python dependency; one string crossing, consumed once.
+Kill criteria: <2x on split+format — passed on every workload (min 4.3x).
+Peak RSS runs ~0-20% above pure on bulk workloads (batch token tables
+vs the pure generator pipeline); parse-8x improved from +33% to +9% by
+constructing the tree directly in the binding, and the lexer drops its
+char/offset tables before returning.
 - `src/` — PyO3 binding (`tokenize_flat` / `parse_flat` / `format_flat` /
   `split_flat`); no `unsafe`.
 - `sqlparse/` — facade: byte-identical upstream tree except `__init__.py`
