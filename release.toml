@@ -1,0 +1,51 @@
+# Release configuration for the `sqlparse` converted project.
+#
+# This file is the single source of truth for publishing the rustsmith output
+# as a reusable Rust core crate (crates.io) plus a Python package calling that
+# same core (PyPI). Field meanings are documented in `docs/RELEASE.md`.
+
+[release]
+schema = 1
+# Original package identity.
+project = "sqlparse"
+# Rust core crate published to crates.io (`sqlparse-core/Cargo.toml [package] name`).
+rust_crate = "sqlparse-rust-core"
+# Python distribution published to PyPI (`pyproject.toml [project] name`).
+# MUST differ from `project`: the original name stays with upstream.
+pypi_dist = "sqlparse-rust"
+# Python import name. MUST equal the package's import name: users swap the
+# install with zero import changes (`pip install sqlparse-rust`
+# still does `import sqlparse`).
+python_import = "sqlparse"
+# Release version. MUST equal `[package] version` in `Cargo.toml`,
+# `sqlparse-core/Cargo.toml`, and `[project] version` in `pyproject.toml`.
+# Snapshot of upstream 0.6.0 at port time.
+version = "0.6.0"
+# Supported Python versions (workflow matrix) and the matching floor.
+requires_python = ">=3.10"
+python_versions = ["3.10", "3.11", "3.12", "3.13", "3.14"]
+# GitHub runners the release workflow builds and tests on.
+platforms = ["ubuntu-22.04", "macos-14", "windows-2022"]
+
+# Publishing repository and workflow identity (trusted publishing, no tokens).
+github_repo = "John-Cusack/sqlparse-rust"
+release_workflow = ".github/workflows/release.yml"
+pypi_environment = "pypi"
+testpypi_environment = "testpypi"
+
+# License and upstream attribution.
+license_spdx = "BSD-3-Clause"
+upstream = "andialbrecht/sqlparse"
+upstream_url = "https://github.com/andialbrecht/sqlparse"
+upstream_license = "BSD-3-Clause"
+upstream_authors = "Andi Albrecht"
+
+# Smoke checks run against the installed wheel (Python expressions; each must
+# evaluate truthy). Kept to stdlib-only, deterministic vectors.
+smoke_exprs = [
+  "len(sqlparse.parse('select * from foo;')) == 1",
+  "sqlparse.split('select 1; select 2;') == ['select 1;', 'select 2;']",
+  "sqlparse.format('select * from foo', keyword_case='upper') == 'SELECT * FROM foo'",
+  "str(sqlparse.parse('select a from t')[0].get_type()) == 'SELECT'",
+  "len(sqlparse.__version__) > 0",
+]

@@ -1,0 +1,19 @@
+[package]
+name = "sqlparse-rust"
+version = "0.6.0"
+edition = "2021"
+description = "Hot-unit port of andialbrecht/sqlparse (lexer + splitter + grouping + format): sqlparse-core crate + PyO3 binding, BSD-3, upstream-attributed"
+license = "BSD-3-Clause"
+repository = "https://github.com/John-Cusack/sqlparse-rust"
+homepage = "https://github.com/andialbrecht/sqlparse"
+
+[lib]
+name = "_sqlparse"
+crate-type = ["cdylib"]
+
+[dependencies]
+sqlparse-rust-core = { path = "sqlparse-core", version = "0.6.0" }
+pyo3 = { version = "0.23", features = ["macros"] }
+
+[workspace]
+members = ["sqlparse-core"]

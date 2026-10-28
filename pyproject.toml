@@ -1,0 +1,45 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sqlparse-rust"
+version = "0.6.0"
+description = "Rust port of andialbrecht/sqlparse (non-validating SQL parser): hot-unit kernel in Rust, same API"
+authors = [{ name = "Andi Albrecht", email = "albrecht.andi@gmail.com" }]
+maintainers = [{ name = "John Cusack" }]
+requires-python = ">=3.10"
+readme = "README.md"
+license = "BSD-3-Clause"
+keywords = ["sql", "parser", "formatter", "rust"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Rust",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Database",
+  "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/John-Cusack/sqlparse-rust"
+Upstream = "https://github.com/andialbrecht/sqlparse"
+
+[tool.maturin]
+module-name = "sqlparse._sqlparse"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
+# The reusable Rust core ships inside the sdist as a path dependency
+# (verified by release-prep: the sdist rebuild test builds the wheel from
+# the unpacked sdist with no network checkout).
+sdist-include = ["sqlparse-core/**/*", "NOTICE", "release.toml"]
