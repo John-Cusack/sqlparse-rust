@@ -116,6 +116,23 @@ class Lexer:
 
         ``stack`` is the initial stack (default: ``['root']``)
         """
+        # Fast path (port addition): default-configured default singleton
+        # lexes in Rust; anything else runs the generator below verbatim.
+        if type(self) is Lexer:
+            from sqlparse import _bridge
+
+            coerced = _bridge.coerce_text(text, encoding)
+            if coerced is not None and _bridge.use_rust():
+                from sqlparse import _sqlparse
+
+                return iter(
+                    (_bridge.resolve_ttype(p), v)
+                    for p, v in _sqlparse.tokenize_flat(coerced)
+                )
+        return self._get_tokens_pure(text, encoding)
+
+    def _get_tokens_pure(self, text, encoding=None):
+        """Original `get_tokens` generator, verbatim (pure-Python path)."""
         if isinstance(text, TextIOBase):
             text = text.read()
 
